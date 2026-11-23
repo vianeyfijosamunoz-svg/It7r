@@ -19,6 +19,31 @@ local SpectateController = require(lplr.PlayerScripts.Controllers:WaitForChild("
 
 local PRIORITIES = { "Closest", "Lowest HP", "Locked" }
 local UNDERGROUND_TRIGGER_RANGE = 500
+local FIXED_UE_UNDERGROUND_DEPTH = 5.0
+
+local BODY_PARTS = {
+	"Head", "UpperTorso", "LowerTorso", "HumanoidRootPart",
+	"LeftUpperArm", "LeftLowerArm", "LeftHand",
+	"RightUpperArm", "RightLowerArm", "RightHand",
+	"LeftUpperLeg", "LeftLowerLeg", "LeftFoot",
+	"RightUpperLeg", "RightLowerLeg", "RightFoot",
+	"Torso", "Left Arm", "Right Arm", "Left Leg", "Right Leg",
+	"LeftProstheticLeg", "RightProstheticLeg", "LeftProstheticArm", "RightProstheticArm",
+	"Neck", "RootPart", "Display", "HatAttachment", "FaceFrontAttachment"
+}
+
+local FOV_COLORS = {
+	Rainbow = nil,
+	Red = Color3.fromRGB(255, 70, 70),
+	Blue = Color3.fromRGB(80, 155, 255),
+	Green = Color3.fromRGB(70, 235, 130),
+	Purple = Color3.fromRGB(185, 110, 255),
+	Orange = Color3.fromRGB(255, 155, 55),
+	White = Color3.fromRGB(245, 245, 255)
+}
+local FOV_COLOR_NAMES = { "Rainbow", "Red", "Blue", "Green", "Purple", "Orange", "White" }
+
+getgenv().SilentAimEnabled = false
 
 local config = {
 	VoidEnabled = false,
@@ -42,7 +67,15 @@ local config = {
 
 	UeCounterEnabled = false,
 	UeBlockHit = true,
-	UeUndergroundDepth = 5.0,
+
+	SilentAimEnabled = false,
+	WallCheck = true,
+	ShowFov = true,
+	FovRadius = 180,
+	FovColorIndex = 1,
+	HitChance = 100,
+	MaxDistance = 500,
+	BodyPartIndex = 1,
 
 	TargetHudEnabled = true,
 	TargetHighlightEnabled = true,
@@ -77,6 +110,8 @@ local config = {
 		OrbitBlockHit = Enum.KeyCode.H,
 		UeCounter = Enum.KeyCode.U,
 		UeBlockHit = Enum.KeyCode.Unknown,
+		SilentAim = Enum.KeyCode.Unknown,
+		ShowFov = Enum.KeyCode.Unknown,
 		InfiniteJump = Enum.KeyCode.Space,
 		MiscNoClip = Enum.KeyCode.N,
 		FullBright = Enum.KeyCode.L,
@@ -100,6 +135,7 @@ local orbitAngle = 0
 local lockedTarget = nil
 local undergroundTargetCFrame = nil
 local ueTargetCFrame = nil
+local activeTargetPos = nil
 local listeningAction = nil
 local savedCollisions = {}
 local savedLighting = {
@@ -111,6 +147,9 @@ local savedLighting = {
 
 if CoreGui:FindFirstChild("ApocalypseFreeV135") then
 	CoreGui.ApocalypseFreeV135:Destroy()
+end
+if CoreGui:FindFirstChild("ApocalypseSilentAimFov") then
+	CoreGui.ApocalypseSilentAimFov:Destroy()
 end
 if CoreGui:FindFirstChild("SuperFullVoidHub") then
 	CoreGui.SuperFullVoidHub:Destroy()
@@ -241,6 +280,28 @@ lplr.CharacterAdded:Connect(function(newChar)
 		end
 	end)
 end)
+
+local FovGui = Instance.new("ScreenGui")
+FovGui.Name = "ApocalypseSilentAimFov"
+FovGui.IgnoreGuiInset = true
+FovGui.ResetOnSpawn = false
+FovGui.Parent = (gethui and gethui()) or CoreGui
+
+local FovCircle = Instance.new("Frame")
+FovCircle.Name = "FovCircle"
+FovCircle.AnchorPoint = Vector2.new(0.5, 0.5)
+FovCircle.Position = UDim2.new(0.5, 0, 0.5, 0)
+FovCircle.BackgroundTransparency = 1
+FovCircle.Visible = config.ShowFov
+FovCircle.Parent = FovGui
+
+local FovStroke = Instance.new("UIStroke")
+FovStroke.Thickness = 2
+FovStroke.Parent = FovCircle
+
+local FovCorner = Instance.new("UICorner")
+FovCorner.CornerRadius = UDim.new(1, 0)
+FovCorner.Parent = FovCircle
 
 local ScreenGui = Instance.new("ScreenGui")
 ScreenGui.Name = "ApocalypseFreeV135"
@@ -382,7 +443,7 @@ TargetMetaLabel.TextXAlignment = Enum.TextXAlignment.Left
 TargetMetaLabel.Font = Enum.Font.GothamMedium
 TargetMetaLabel.TextSize = 11
 TargetMetaLabel.ZIndex = 21
-TargetMetaLabel.Parent = TargetHudFrame
+TargetHudFrame.Parent = ScreenGui
 
 local TargetHpBarBg = Instance.new("Frame")
 TargetHpBarBg.Size = UDim2.new(1, -16, 0, 8)
@@ -896,6 +957,7 @@ local VoidTab = createTab("Void", true)
 local RagebotTab = createTab("Ragebot", false)
 local OrbitTab = createTab("Orbit", false)
 local UeTab = createTab("UE COUNTER", false)
+local CombatTab = createTab("COMBAT", false)
 local VisualsTab = createTab("Visuals", false)
 local MiscTab = createTab("Misc", false)
 
@@ -919,7 +981,11 @@ local function isEnemy(player)
 	local pTeam = player:GetAttribute("TeamID")
 	local lTeam = lplr:GetAttribute("TeamID")
 	if pTeam ~= nil and lTeam ~= nil then
-		return pTeam ~= lTeam
+		return tostring(pTeam) ~= tostring(lTeam)
+	end
+
+	if lplr.Team and player.Team then
+		return lplr.Team ~= player.Team
 	end
 
 	return true
@@ -998,6 +1064,81 @@ local function getClosestTarget(myPos)
 	end
 
 	return bestPlayer, bestRoot, bestHead
+end
+
+local function getValidSilentTargetPart(pChar)
+	local cam = Workspace.CurrentCamera
+	if not cam or not pChar then return nil end
+	local chosenName = BODY_PARTS[config.BodyPartIndex] or "Head"
+	local part = pChar:FindFirstChild(chosenName) or pChar:FindFirstChild("Head") or pChar:FindFirstChild("HumanoidRootPart")
+	if not part or not part:IsA("BasePart") then return nil end
+
+	if config.WallCheck then
+		local params = RaycastParams.new()
+		params.FilterType = Enum.RaycastFilterType.Exclude
+		params.FilterDescendantsInstances = { lplr.Character, cam }
+		local origin = cam.CFrame.Position
+		local direction = part.Position - origin
+		local result = Workspace:Raycast(origin, direction, params)
+		if result and not result.Instance:IsDescendantOf(pChar) then
+			return nil
+		end
+	end
+
+	return part
+end
+
+local function updateSilentAimTarget()
+	local cam = Workspace.CurrentCamera
+	if not cam then
+		activeTargetPos = nil
+		return
+	end
+
+	local colorName = FOV_COLOR_NAMES[config.FovColorIndex] or "Rainbow"
+	local chosenColor = FOV_COLORS[colorName] or Color3.fromHSV((tick() % 5) / 5, 1, 1)
+	local screenCenter = cam.ViewportSize / 2
+
+	FovCircle.Visible = config.ShowFov
+	if config.ShowFov then
+		FovCircle.Size = UDim2.new(0, config.FovRadius * 2, 0, config.FovRadius * 2)
+		FovStroke.Color = chosenColor
+	end
+
+	if not config.SilentAimEnabled or not getgenv().SilentAimEnabled then
+		activeTargetPos = nil
+		return
+	end
+
+	if math.random(1, 100) > config.HitChance then
+		activeTargetPos = nil
+		return
+	end
+
+	local bestPart = nil
+	local shortestDist = math.huge
+	local chosenName = BODY_PARTS[config.BodyPartIndex] or "Head"
+
+	for _, plr in ipairs(plrs:GetPlayers()) do
+		if not isTargetValid(plr) then continue end
+		local pChar = plr.Character
+		local candidate = pChar:FindFirstChild(chosenName) or pChar:FindFirstChild("Head") or pChar:FindFirstChild("HumanoidRootPart")
+		if candidate and candidate:IsA("BasePart") then
+			local distFromMe = (candidate.Position - cam.CFrame.Position).Magnitude
+			local partPos, partOnScreen = cam:WorldToViewportPoint(candidate.Position)
+			local fovDist = (Vector2.new(partPos.X, partPos.Y) - screenCenter).Magnitude
+
+			if partOnScreen and distFromMe <= config.MaxDistance and fovDist <= config.FovRadius and fovDist < shortestDist then
+				local validPart = getValidSilentTargetPart(pChar)
+				if validPart then
+					shortestDist = fovDist
+					bestPart = validPart
+				end
+			end
+		end
+	end
+
+	activeTargetPos = bestPart and bestPart.Position or nil
 end
 
 local function fireAtTarget(originPos, targetHead, itemId, startShootingEnum)
@@ -1081,7 +1222,7 @@ end
 
 local function refreshStatusText()
 	if config.UeCounterEnabled then
-		setStatus(string.format("ue counter: underground %.2f", config.UeUndergroundDepth), Color3.fromRGB(255, 175, 55))
+		setStatus(string.format("ue counter: underground %.1f", FIXED_UE_UNDERGROUND_DEPTH), Color3.fromRGB(255, 175, 55))
 	elseif config.RagebotEnabled then
 		local itemId = getEquippedObjectId()
 		if not itemId then
@@ -1121,9 +1262,12 @@ end
 local function startVisualsLoop()
 	if visualsConn then visualsConn:Disconnect() end
 	visualsConn = runS.RenderStepped:Connect(function()
+		updateSilentAimTarget()
+
 		ActiveHudFrame.Visible = config.ActiveModulesHudEnabled
 		if config.ActiveModulesHudEnabled then
 			local lines = { "APOCALYPSE FREE V1.35" }
+			if config.SilentAimEnabled and getgenv().SilentAimEnabled then table.insert(lines, "• SilentAim [" .. getKeyName(config.Keybinds.SilentAim) .. "]") end
 			if config.UeCounterEnabled then table.insert(lines, "• UE Counter [" .. getKeyName(config.Keybinds.UeCounter) .. "]") end
 			if config.VoidEnabled then table.insert(lines, "• Void [" .. getKeyName(config.Keybinds.Void) .. "]") end
 			if config.RagebotEnabled then table.insert(lines, "• Ragebot [" .. getKeyName(config.Keybinds.Ragebot) .. "]") end
@@ -1224,7 +1368,7 @@ local function startUeCounterLoop()
 		if not currentChar or not currentHrp then return end
 
 		if not ueTargetCFrame then
-			ueTargetCFrame = currentHrp.CFrame - Vector3.new(0, config.UeUndergroundDepth, 0)
+			ueTargetCFrame = currentHrp.CFrame - Vector3.new(0, FIXED_UE_UNDERGROUND_DEPTH, 0)
 		end
 
 		for _, part in ipairs(currentChar:GetDescendants()) do
@@ -1332,6 +1476,9 @@ local updateOrbitToggleVisual
 local updateOrbitBlockHitVisual
 local updateUeCounterVisual
 local updateUeBlockHitVisual
+local updateSilentAimVisual
+local updateWallCheckVisual
+local updateShowFovVisual
 local updateTargetHudVisual
 local updateTargetHighlightVisual
 local updateActiveHudVisual
@@ -1344,10 +1491,13 @@ local updateJumpPowerVisual
 local updateAntiAfkVisual
 local updateFovVisual
 local setPriorityIndexVisual
+local setBodyPartIndexVisual
+local setFovColorIndexVisual
 local setVoidState
 local setRagebotState
 local setOrbitState
 local setUeCounterState
+local setSilentAimState
 
 local function setMenuVisible(visible)
 	MainFrame.Visible = visible
@@ -1487,7 +1637,7 @@ setUeCounterState = function(state)
 		if config.RagebotEnabled then setRagebotState(false) end
 		if config.OrbitEnabled then setOrbitState(false) end
 		local currentHrp = lplr.Character and lplr.Character:FindFirstChild("HumanoidRootPart")
-		ueTargetCFrame = currentHrp and (currentHrp.CFrame - Vector3.new(0, config.UeUndergroundDepth, 0)) or nil
+		ueTargetCFrame = currentHrp and (currentHrp.CFrame - Vector3.new(0, FIXED_UE_UNDERGROUND_DEPTH, 0)) or nil
 	else
 		ueTargetCFrame = nil
 	end
@@ -1520,6 +1670,18 @@ setUeCounterState = function(state)
 		notify("UE COUNTER: OFF", Color3.fromRGB(220, 90, 90))
 	end
 	return true
+end
+
+setSilentAimState = function(state)
+	config.SilentAimEnabled = state
+	getgenv().SilentAimEnabled = state
+	if not state then
+		activeTargetPos = nil
+	end
+	if updateSilentAimVisual then
+		updateSilentAimVisual(state)
+	end
+	notify("Silent Aim: " .. (state and "ON" or "OFF"), Color3.fromRGB(255, 95, 130))
 end
 
 local function setNoClipState(state)
@@ -1648,6 +1810,7 @@ local function applyPreset(presetName)
 		setVoidState(false)
 		setRagebotState(false)
 		setOrbitState(false)
+		setSilentAimState(false)
 		setNoClipState(false)
 		setFullBrightState(false)
 		setWalkSpeedState(false)
@@ -1656,10 +1819,22 @@ local function applyPreset(presetName)
 		config.UndergroundManipulation = false
 		undergroundTargetCFrame = nil
 		if updateUndergroundVisual then updateUndergroundVisual(false) end
-		config.UeUndergroundDepth = 5.0
 		config.UeBlockHit = true
-		if sliderSetters["UE Underground Depth"] then sliderSetters["UE Underground Depth"](5.0) end
 		if updateUeBlockHitVisual then updateUeBlockHitVisual(true) end
+		config.WallCheck = true
+		config.ShowFov = true
+		config.FovRadius = 180
+		config.FovColorIndex = 1
+		config.HitChance = 100
+		config.MaxDistance = 500
+		config.BodyPartIndex = 1
+		if updateWallCheckVisual then updateWallCheckVisual(true) end
+		if updateShowFovVisual then updateShowFovVisual(true) end
+		if sliderSetters["FOV Radius"] then sliderSetters["FOV Radius"](180) end
+		if sliderSetters["Hit Chance (%)"] then sliderSetters["Hit Chance (%)"](100) end
+		if sliderSetters["Max Distance"] then sliderSetters["Max Distance"](500) end
+		if setFovColorIndexVisual then setFovColorIndexVisual(1) end
+		if setBodyPartIndexVisual then setBodyPartIndexVisual(1) end
 		config.StatusOffsetY = -15
 		config.StatusScale = 1
 		syncStatusVisual()
@@ -1765,14 +1940,44 @@ updateUeBlockHitVisual = createToggle(UeTab, "UE Block Hit", config.UeBlockHit, 
 	config.UeBlockHit = state
 end)
 
-createSlider(UeTab, "UE Underground Depth", 4.8, 5.5, config.UeUndergroundDepth, 2, function(val)
-	config.UeUndergroundDepth = val
-	if config.UeCounterEnabled then
-		local currentHrp = lplr.Character and lplr.Character:FindFirstChild("HumanoidRootPart")
-		if currentHrp then
-			ueTargetCFrame = currentHrp.CFrame - Vector3.new(0, config.UeUndergroundDepth, 0)
-		end
-	end
+createSection(CombatTab, "Silent Aim")
+
+updateSilentAimVisual = createToggle(CombatTab, "Silent Aim Enabled", config.SilentAimEnabled, "SilentAim", function(state)
+	setSilentAimState(state)
+end)
+
+updateWallCheckVisual = createToggle(CombatTab, "Wall Check", config.WallCheck, nil, function(state)
+	config.WallCheck = state
+	notify("Wall Check: " .. (state and "ON" or "OFF"), Color3.fromRGB(110, 180, 255))
+end)
+
+setBodyPartIndexVisual = createCycleButton(CombatTab, "Target Part", BODY_PARTS, config.BodyPartIndex, function(idx, partName)
+	config.BodyPartIndex = idx
+	notify("Body Part: " .. partName, Color3.fromRGB(255, 95, 130))
+end)
+
+createSlider(CombatTab, "Hit Chance (%)", 0, 100, config.HitChance, 0, function(val)
+	config.HitChance = val
+end)
+
+createSlider(CombatTab, "Max Distance", 50, 2500, config.MaxDistance, 0, function(val)
+	config.MaxDistance = val
+end)
+
+createSection(CombatTab, "FOV Circle")
+
+updateShowFovVisual = createToggle(CombatTab, "Show FOV", config.ShowFov, "ShowFov", function(state)
+	config.ShowFov = state
+	FovCircle.Visible = state
+end)
+
+setFovColorIndexVisual = createCycleButton(CombatTab, "FOV Color", FOV_COLOR_NAMES, config.FovColorIndex, function(idx, colorName)
+	config.FovColorIndex = idx
+	notify("FOV Color: " .. colorName, Color3.fromRGB(110, 180, 255))
+end)
+
+createSlider(CombatTab, "FOV Radius", 20, 600, config.FovRadius, 0, function(val)
+	config.FovRadius = val
 end)
 
 createSection(VisualsTab, "ESP & HUD")
@@ -1897,6 +2102,8 @@ createKeybindRow(MiscTab, "Keybind: Orbit", "Orbit")
 createKeybindRow(MiscTab, "Keybind: Block Hit (Orbit)", "OrbitBlockHit")
 createKeybindRow(MiscTab, "Keybind: UE Counter", "UeCounter")
 createKeybindRow(MiscTab, "Keybind: UE Block Hit", "UeBlockHit")
+createKeybindRow(MiscTab, "Keybind: Silent Aim", "SilentAim")
+createKeybindRow(MiscTab, "Keybind: Show FOV", "ShowFov")
 createKeybindRow(MiscTab, "Keybind: Infinite Jump", "InfiniteJump")
 createKeybindRow(MiscTab, "Keybind: NoClip", "MiscNoClip")
 createKeybindRow(MiscTab, "Keybind: FullBright", "FullBright")
@@ -1948,6 +2155,13 @@ local function triggerKeybind(action)
 		config.UeBlockHit = not config.UeBlockHit
 		if updateUeBlockHitVisual then updateUeBlockHitVisual(config.UeBlockHit) end
 		notify("UE BlockHit: " .. (config.UeBlockHit and "ON" or "OFF"), Color3.fromRGB(255, 175, 55))
+	elseif action == "SilentAim" then
+		setSilentAimState(not config.SilentAimEnabled)
+	elseif action == "ShowFov" then
+		config.ShowFov = not config.ShowFov
+		FovCircle.Visible = config.ShowFov
+		if updateShowFovVisual then updateShowFovVisual(config.ShowFov) end
+		notify("Show FOV: " .. (config.ShowFov and "ON" or "OFF"), Color3.fromRGB(110, 180, 255))
 	elseif action == "InfiniteJump" then
 		config.InfiniteJump = not config.InfiniteJump
 		if updateInfJumpVisual then updateInfJumpVisual(config.InfiniteJump) end
@@ -2003,5 +2217,17 @@ UserInputService.InputBegan:Connect(function(input, gameProcessed)
 		end
 	end
 end)
+
+local oldIndex
+oldIndex = hookmetamethod(game, "__index", newcclosure(function(self, idx)
+	local cam = Workspace.CurrentCamera
+	if config.SilentAimEnabled and getgenv().SilentAimEnabled and activeTargetPos and not checkcaller() and idx == "ViewportSize" and self == cam then
+		local pos, on = cam:WorldToViewportPoint(activeTargetPos)
+		if on then
+			return Vector2.new(pos.X * 2, pos.Y * 2)
+		end
+	end
+	return oldIndex(self, idx)
+end))
 
 startVisualsLoop()
